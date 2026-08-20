@@ -58,8 +58,11 @@ namespace Requestrr.WebApi.RequestrrBot
         private int _waitTimeout = 0;
         private DateTime? _socketClosedAt = null;
         private DateTime? _heartbeatSentAt = null;
-        private const int UnrecoverableHeartbeatInterval = 4;
+        private int _consecutiveClientRecoveries = 0;
+        private const int UnrecoverableHeartbeatInterval = 2;
         private const int UnrecoverableDisconnectTimeoutMinutes = 10;
+        private const int MaxConsecutiveClientRecoveries = 3;
+        private const int ClientDisposeTimeoutSeconds = 30;
 
         public ChatBot(IServiceProvider serviceProvider, ILogger<ChatBot> logger, DiscordSettingsProvider discordSettingsProvider)
         {
@@ -130,15 +133,12 @@ namespace Requestrr.WebApi.RequestrrBot
                     if (_client != null && _socketClosedAt.HasValue &&
                         (DateTime.UtcNow - _socketClosedAt.Value).TotalMinutes >= UnrecoverableDisconnectTimeoutMinutes)
                     {
-                        _logger.LogError($"Discord bot has been disconnected for over {UnrecoverableDisconnectTimeoutMinutes} minutes without reconnecting. Exiting process to allow container restart.");
-                        Environment.Exit(1);
+                        await RecoverDeadClientAsync($"Discord bot has been disconnected for over {UnrecoverableDisconnectTimeoutMinutes} minutes without reconnecting.");
                     }
-
-                    if (_client != null && (DateTime.Now - _heartbeatSentAt.Value).TotalMinutes >=
-                        UnrecoverableHeartbeatInterval)
+                    else if (_client != null && _heartbeatSentAt.HasValue &&
+                        (DateTime.Now - _heartbeatSentAt.Value).TotalMinutes >= UnrecoverableHeartbeatInterval)
                     {
-                        _logger.LogError("Discord bot heartbeat has been stopped. Restarting!");
-                        Environment.Exit(1);
+                        await RecoverDeadClientAsync($"Discord bot heartbeat has not been acknowledged for over {UnrecoverableHeartbeatInterval} minutes.");
                     }
 
                     await Task.Delay(5000);
@@ -150,21 +150,83 @@ namespace Requestrr.WebApi.RequestrrBot
         {
             if (_client != null)
             {
-                await _client.DisconnectAsync();
                 _client.Ready -= Connected;
                 _client.ComponentInteractionCreated -= DiscordComponentInteractionCreatedHandler;
                 _client.ModalSubmitted -= DiscordModalSubmittedHandler;
                 _client.SocketOpened -= OnSocketOpen;
                 _client.SocketClosed -= OnSocketClosed;
                 _client.Heartbeated -= Heartbeat;
-                _client.Dispose();
+
+                try
+                {
+                    await _client.DisconnectAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"Error while disconnecting the Discord client: {ex.Message}");
+                }
+
+                try
+                {
+                    _client.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"Error while disposing the Discord client: {ex.Message}");
+                }
             }
 
             if (_slashCommands != null)
             {
                 _slashCommands.SlashCommandErrored -= SlashCommandErrorHandler;
-                _slashCommands.Dispose();
+
+                try
+                {
+                    _slashCommands.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"Error while disposing the slash commands extension: {ex.Message}");
+                }
             }
+        }
+
+        private async Task RecoverDeadClientAsync(string reason)
+        {
+            _consecutiveClientRecoveries++;
+
+            if (_consecutiveClientRecoveries > MaxConsecutiveClientRecoveries)
+            {
+                _logger.LogError($"{reason} In-process recovery failed {MaxConsecutiveClientRecoveries} times in a row. Exiting process to allow container restart.");
+                Environment.Exit(1);
+            }
+
+            _logger.LogWarning($"{reason} Rebuilding the Discord connection in-process (attempt {_consecutiveClientRecoveries}/{MaxConsecutiveClientRecoveries}).");
+
+            try
+            {
+                var disposeTask = DisposeClient();
+
+                if (await Task.WhenAny(disposeTask, Task.Delay(TimeSpan.FromSeconds(ClientDisposeTimeoutSeconds))) == disposeTask)
+                {
+                    await disposeTask;
+                }
+                else
+                {
+                    // A wedged client can hang while disconnecting; abandon it rather than block recovery.
+                    _logger.LogWarning("Timed out while disposing the dead Discord client, abandoning it.");
+                    _ = disposeTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"Error while disposing the dead Discord client: {ex.Message}");
+            }
+
+            _client = null;
+            _slashCommands = null;
+            _socketClosedAt = null;
+            _heartbeatSentAt = null;
         }
 
         private async Task RestartBot(DiscordSettings previousSettings, DiscordSettings newSettings, HashSet<ulong> currentGuilds)
@@ -302,20 +364,21 @@ namespace Requestrr.WebApi.RequestrrBot
         private Task OnSocketOpen(DiscordClient client, SocketEventArgs args)
         {
             _socketClosedAt = null;
-            _logger.LogDebug($"Discord socket reconnected ({DateTime.Now})");
+            _logger.LogWarning($"Discord socket connected ({DateTime.Now})");
             return Task.CompletedTask;
         }
 
         private Task OnSocketClosed(DiscordClient client, SocketCloseEventArgs args)
         {
             _socketClosedAt = DateTime.UtcNow;
-            _logger.LogDebug($"Discord socket closed (code: {args.CloseCode}): {args.CloseMessage}");
+            _logger.LogWarning($"Discord socket closed (code: {args.CloseCode}): {args.CloseMessage} ({DateTime.Now})");
             return Task.CompletedTask;
         }
 
         private async Task Connected(DiscordClient client, ReadyEventArgs args)
         {
             _socketClosedAt = null;
+            _consecutiveClientRecoveries = 0;
             await ApplyBotConfigurationAsync(_currentSettings);
         }
 
