@@ -1,0 +1,7 @@
+**/bin/
+**/obj/
+**/node_modules/
+Requestrr.WebApi/ClientApp/build/
+.git/
+.github/
+*.md
